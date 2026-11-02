@@ -3525,7 +3525,7 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-10-24t';
+const BUILD = '2026-11-02';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3611,6 +3611,16 @@ const PAGE = `<!DOCTYPE html>
         background:var(--surface);font-size:12.5px;color:var(--dim);white-space:nowrap;box-shadow:var(--sh-1)}
   .chip b{color:var(--txt);font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px}
   .chip .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+
+  /* GitHub 仓库入口 */
+  .gh{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 15px;border-radius:12px;
+      border:1px solid var(--line-2);background:var(--surface);color:var(--txt);font-size:13px;font-weight:600;
+      text-decoration:none;white-space:nowrap;
+      transition:transform .12s ease,box-shadow .18s ease,border-color .18s ease,color .18s ease}
+  .gh svg{width:16px;height:16px;flex:0 0 auto;fill:currentColor}
+  .gh:hover{border-color:var(--txt);transform:translateY(-1px);box-shadow:var(--sh-1)}
+  .gh:active{transform:none}
+  .gh:focus-visible{outline:2px solid var(--pri);outline-offset:2px}
 
   .tabs{display:flex;gap:4px;margin-bottom:18px;padding:4px;border:1px solid var(--line);border-radius:14px;
         background:var(--surface-2);width:fit-content;max-width:100%;overflow:auto}
@@ -3712,6 +3722,8 @@ const PAGE = `<!DOCTYPE html>
   }
   @media (max-width:640px){
     #loginView{min-height:auto;padding:36px 0}
+    .topbar .gh{padding:11px 12px}
+    .topbar .gh .gh-t{display:none}
     .list table,.list tbody,.list tr,.list td{display:block}
     .list thead{display:none}
     .list tbody{display:grid;gap:10px}
@@ -3801,6 +3813,10 @@ const PAGE = `<!DOCTYPE html>
       </div>
       <div class="row">
         <span class="chip"><i class="dot"></i>今日已签 <b id="statAll">—</b></span>
+        <a class="gh" href="https://github.com/ggzhzc/workbuddy-trae-checkin" target="_blank" rel="noopener noreferrer" title="GitHub 仓库 · ggzhzc/workbuddy-trae-checkin" aria-label="GitHub 仓库">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.73.5.9 5.34.9 11.6c0 4.91 3.17 9.07 7.57 10.53.55.1.75-.24.75-.53 0-.26-.01-1.13-.02-2.05-3.08.67-3.73-1.31-3.73-1.31-.5-1.28-1.23-1.62-1.23-1.62-1-.69.08-.67.08-.67 1.11.08 1.7 1.14 1.7 1.14.98 1.69 2.58 1.2 3.21.92.1-.72.39-1.21.7-1.48-2.46-.28-5.05-1.23-5.05-5.48 0-1.21.43-2.2 1.14-2.98-.12-.28-.5-1.41.11-2.94 0 0 .93-.3 3.05 1.14a10.5 10.5 0 0 1 5.56 0c2.11-1.44 3.04-1.14 3.04-1.14.61 1.53.23 2.66.11 2.94.71.78 1.14 1.77 1.14 2.98 0 4.26-2.6 5.19-5.07 5.47.4.34.75 1.01.75 2.04 0 1.48-.01 2.68-.01 3.04 0 .29.19.64.76.53 4.4-1.46 7.56-5.62 7.56-10.53C23.1 5.34 18.27.5 12 .5z"/></svg>
+          <span class="gh-t">GitHub</span>
+        </a>
         <button id="runAll" class="pri">全部签到</button>
         <button id="notifyOpen" title="配置签到结果通知">通知</button>
         <button id="logout">退出登录</button>
