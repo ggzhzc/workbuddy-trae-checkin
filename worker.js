@@ -2960,6 +2960,301 @@ return { fetch: __mod.fetch, scheduled: __mod.scheduled };
 
 
 /* ================================================================== */
+/* MiniMax Code 国内版：设备授权与每日签到                               */
+/* ================================================================== */
+
+const MiniMax = (() => {
+  const ACCOUNT = 'https://account.minimax.cn';
+  const ORIGIN = 'https://agent.minimaxi.com';
+  const CLIENT = 'mcode-public';
+  const INDEX = 'index:accounts';
+  const encoder = new TextEncoder();
+  const text = v => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+  const number = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  const day = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
+  const idValid = id => typeof id === 'string' && /^[a-f0-9]{24}$/.test(id);
+  const runtimes = new WeakMap();
+  function runtime(env) {
+    if (!runtimes.has(env.KV)) runtimes.set(env.KV, new Map());
+    return runtimes.get(env.KV);
+  }
+  // 仅合并同一 isolate 的请求；KV 最终一致性不提供跨节点锁。
+  function merge(env, key, fn) {
+    const jobs = runtime(env);
+    if (jobs.has(key)) return jobs.get(key);
+    const task = Promise.resolve().then(fn).finally(() => { if (jobs.get(key) === task) jobs.delete(key); });
+    jobs.set(key, task);
+    return task;
+  }
+  function serial(env, key, fn) {
+    const jobs = runtime(env);
+    const task = (jobs.get(key) || Promise.resolve()).catch(() => {}).then(fn);
+    jobs.set(key, task);
+    return task.finally(() => { if (jobs.get(key) === task) jobs.delete(key); });
+  }
+  function fail(message = 'MiniMax 响应格式发生变化，未确认签到。', state = 'error', status = 502) {
+    return Object.assign(new Error(message), { minimaxSafe: true, state, status });
+  }
+  function safe(e) { return e?.minimaxSafe ? e : fail('MiniMax 请求或存储失败，请稍后重试。'); }
+  const hex = data => Array.from(new Uint8Array(data), b => b.toString(16).padStart(2, '0')).join('');
+  const digest = async (value, alg = 'SHA-256') => crypto.subtle.digest(alg, encoder.encode(value));
+  const hash = async (value, alg) => hex(await digest(value, alg));
+  const random = bytes => crypto.getRandomValues(new Uint8Array(bytes));
+  const base64url = bytes => nvB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  async function get(env, key) {
+    const raw = await env.MINIMAX_KV.get(key);
+    return raw ? nvOpen(env, raw) : null;
+  }
+  async function kvWrite(env, key, operation) {
+    return serial(env, 'write:' + key, async () => {
+      for (let attempt = 0; ; attempt++) {
+        try { return await operation(); }
+        catch (e) {
+          const limited = e?.status === 429 || e?.statusCode === 429 || /\b429\b/.test(String(e?.message || ''));
+          if (!limited || attempt >= 4) throw e;
+          // KV 同键写入限速时退避重试；不提供跨节点互斥保证。
+          await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+        }
+      }
+    });
+  }
+  async function put(env, key, value, ttl) {
+    const sealed = await nvSeal(env, value);
+    await kvWrite(env, key, () => env.MINIMAX_KV.put(key, sealed, ttl ? { expirationTtl: Math.max(60, Math.ceil(ttl)) } : undefined));
+  }
+  async function ids(env) { return JSON.parse(await env.MINIMAX_KV.get(INDEX) || '[]'); }
+  async function addIndex(env, id) {
+    await serial(env, 'index', async () => { const list = await ids(env); if (!list.includes(id)) await kvWrite(env, INDEX, () => env.MINIMAX_KV.put(INDEX, JSON.stringify([...list, id]))); });
+  }
+  async function request(url, options = {}, oauth = false) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      const response = await fetch(url, { ...options, redirect: 'error', signal: controller.signal });
+      if (!response.ok && !(oauth && response.status === 400)) {
+        throw Object.assign(fail('MiniMax 请求未获确认（HTTP ' + response.status + '）。', [401, 403].includes(response.status) ? 'token_dead' : 'error'), { uncertain: response.status >= 500 });
+      }
+      return await response.json();
+    } catch (e) { throw e?.minimaxSafe ? e : Object.assign(safe(e), { uncertain: true }); }
+    finally { clearTimeout(timer); }
+  }
+  const form = (path, data) => request(ACCOUNT + path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: new URLSearchParams(data).toString() }, true);
+  async function api(path, credential, body, identity = false) {
+    const now = Date.now(), second = Math.floor(now / 1000);
+    const url = new URL(path, ORIGIN);
+    url.search = new URLSearchParams({
+      device_platform: identity ? 'mcode' : 'web', biz_id: '3', app_id: '3001', version_code: '22201',
+      ...(!identity ? { is_desktop: '1', desktop_version: '0.6.5' } : {}),
+      unix: String(now), timezone_offset: String(new Date().getTimezoneOffset() * -60), sys_language: 'zh', lang: 'zh',
+      device_id: '0', os_name: 'linux', browser_name: 'mcode', user_id: credential.realUserID || '0', client: 'mcode',
+    }).toString();
+    // MD5 为 Workers Web Crypto 的旧协议互操作扩展，不用于凭据加密。
+    const headers = {
+      Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'MiniMaxCode', Authorization: 'Bearer ' + credential.accessToken,
+      yy: await hash(encodeURIComponent(url.pathname + url.search) + '_' + (body ?? '{}') + await hash(String(now), 'MD5') + 'ooui', 'MD5'),
+      'x-timestamp': String(second), 'x-signature': await hash(second + 'I*7Cf%WZ#S&%1RlZJ&C2' + (body ?? ''), 'MD5'),
+    };
+    return request(url.href, { method: body === undefined ? 'GET' : 'POST', headers, ...(body === undefined ? {} : { body }) });
+  }
+  function unwrap(doc) {
+    const code = doc?.base_resp?.status_code;
+    if (code === 1000048) throw fail('MiniMax 登录失效或需要官方验证，请重新授权。', 'token_dead');
+    if (code !== 0) throw Number.isFinite(code) ? fail('MiniMax 请求未获确认（业务码 ' + code + '）。') : fail();
+    if (!doc.data || typeof doc.data !== 'object' || Array.isArray(doc.data)) throw fail();
+    return doc.data;
+  }
+  function panel(value) {
+    if (!value || !Number.isInteger(value.scene) || value.scene < 0 || value.scene > 4 || !Array.isArray(value.days) || value.days.length !== 7) throw fail();
+    const days = value.days;
+    if (new Set(days.map(d => d?.day_no)).size !== 7 || days.some(d => !d || !Number.isInteger(d.day_no) || d.day_no < 1 || d.day_no > 7 || !number(d.points) || d.bonus_points !== undefined && !number(d.bonus_points) || ![1, 2, 3, 4].includes(d.status) || typeof d.is_today !== 'boolean') || days.filter(d => d.is_today).length > 1 || days.filter(d => d.status === 2).length > 1) throw fail();
+    return value;
+  }
+  async function identity(c) {
+    const doc = await api('/v1/api/user/info', c, undefined, true);
+    if (doc?.base_resp !== undefined && doc.base_resp?.status_code !== 0) unwrap(doc);
+    if (doc?.statusInfo !== undefined && doc.statusInfo?.code !== 0) throw fail('MiniMax 账号验证失败，请重新授权。', 'token_dead');
+    const data = doc?.data ?? doc;
+    const user = data?.userInfo ?? data?.user_info ?? doc?.userInfo ?? doc?.user_info;
+    const id = text(user?.realUserID) ?? text(user?.real_user_id);
+    if (!id) throw fail('MiniMax 未返回有效账号标识，请重新授权。');
+    return id;
+  }
+  function grant(doc, previous) {
+    let claims;
+    try { const payload = doc.access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); claims = JSON.parse(new TextDecoder().decode(nvUnb64(payload))); } catch {}
+    const rawScope = doc.scope ?? claims?.scope ?? claims?.scp;
+    const scopes = typeof rawScope === 'string' ? rawScope.split(/\s+/) : Array.isArray(rawScope) ? rawScope : [];
+    if (!scopes.includes('agent.default') || !text(doc.access_token) || !text(doc.refresh_token ?? previous?.refreshToken) || !number(doc.expires_in) || doc.expires_in <= 0 || typeof doc.token_type !== 'string' || doc.token_type.toLowerCase() !== 'bearer') throw fail();
+    const expiresAtMs = Date.now() + doc.expires_in * 1000;
+    if (!Number.isFinite(expiresAtMs)) throw fail();
+    return { accessToken: doc.access_token, refreshToken: doc.refresh_token ?? previous?.refreshToken, expiresAtMs };
+  }
+  async function start(env) {
+    const verifier = base64url(random(32));
+    const doc = await form('/oauth2/device/code', { client_id: CLIENT, scope: 'agent.default', audience: 'agent-backend', code_challenge: base64url(new Uint8Array(await digest(verifier))), code_challenge_method: 'S256' });
+    const custom = !doc.device_code && number(doc.expired_in);
+    const code = text(custom ? doc.user_code : doc.device_code), userCode = text(doc.user_code);
+    const ttl = doc.expires_in ?? (doc.expired_in >= 1e12 ? (doc.expired_in - Date.now()) / 1000 : doc.expired_in);
+    let url;
+    try { url = new URL(doc.verification_uri_complete ?? doc.verification_uri ?? doc.verification_url); } catch { throw fail(); }
+    if (url.protocol !== 'https:' || !['account.minimax.cn', 'agent.minimaxi.com', 'agent.minimax.cn'].includes(url.hostname) || url.username || url.password || url.port || !code || !userCode || !number(ttl) || ttl <= 0) throw fail();
+    const interval = Math.max(3000, Math.min(60000, number(doc.interval) && doc.interval > 0 ? doc.interval * (custom ? 1 : 1000) : 5000));
+    const expiresAt = Date.now() + Math.min(ttl, 900) * 1000, nonce = hex(random(16));
+    await put(env, 'login:' + nonce, { verifier, code, custom, interval, expiresAt, nextPollAt: Date.now() + interval, status: 'pending' }, 1200);
+    return { nonce, verificationUrl: url.href, userCode, expiresAt, interval };
+  }
+  function loginView(s) {
+    return { status: s.status, interval: s.interval || 5000, message: s.message || ({ pending: '等待官方授权确认。', authorized: '授权成功。', expired: '授权已过期，请重新开始。', failed: '授权失败，请重新开始。' }[s.status]), ...(s.accountId ? { accountId: s.accountId } : {}) };
+  }
+  async function poll(env, nonce) {
+    if (!/^[a-f0-9]{32}$/.test(nonce || '')) return loginView({ status: 'expired' });
+    return merge(env, 'poll:' + nonce, async () => {
+      const key = 'login:' + nonce;
+      const s = await get(env, key);
+      if (!s) return loginView({ status: 'expired' });
+      if (s.status !== 'pending') return loginView(s);
+      if (s.expiresAt <= Date.now()) { await put(env, key, { status: 'expired' }, 120); return loginView({ status: 'expired' }); }
+      if (Date.now() < s.nextPollAt) return loginView(s);
+      s.nextPollAt = Date.now() + s.interval;
+      await put(env, key, s, 1200);
+      try {
+        if (!s.credential) {
+          const doc = await form('/oauth2/token', { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', [s.custom ? 'user_code' : 'device_code']: s.code, client_id: CLIENT, code_verifier: s.verifier });
+          const status = doc.error ?? doc.status;
+          if (['authorization_pending', 'pending', 'slow_down'].includes(status)) {
+            if (status === 'slow_down') s.interval = Math.min(60000, s.interval + 5000);
+            s.nextPollAt = Date.now() + s.interval;
+            await put(env, key, s, 1200); return loginView(s);
+          }
+          if (status) { s.status = status === 'expired_token' ? 'expired' : 'failed'; await put(env, key, { status: s.status }, 120); return loginView(s); }
+          s.credential = grant(doc);
+          await put(env, key, s, 1200);
+        }
+        const realUserID = await identity(s.credential);
+        const id = (await hash(realUserID)).slice(0, 24);
+        await serial(env, 'acct:' + id, async () => {
+          const old = await get(env, 'acct:' + id);
+          await put(env, 'acct:' + id, { ...old, ...s.credential, realUserID, id, identityPending: false, label: old?.label || 'MiniMax-' + id.slice(0, 6), totalCredit: old?.totalCredit || 0 });
+          await addIndex(env, id);
+        });
+        const terminal = { status: 'authorized', accountId: id, interval: s.interval };
+        await put(env, key, terminal, 1200);
+        return loginView(terminal);
+      } catch (e) {
+        const err = safe(e);
+        if (s.credential && err.uncertain) {
+          s.message = 'MiniMax 账号验证暂未完成，将保留授权凭据并重试。';
+          await put(env, key, s, 1200);
+          return loginView(s);
+        }
+        await put(env, key, { status: 'failed', message: err.message, interval: s.interval }, 120);
+        return loginView({ status: 'failed', message: err.message, interval: s.interval });
+      }
+    });
+  }
+  async function credential(env, c) {
+    if (c.expiresAtMs <= Date.now() + 60000) {
+      const doc = await form('/oauth2/token', { grant_type: 'refresh_token', refresh_token: c.refreshToken, client_id: CLIENT, scope: 'agent.default', audience: 'agent-backend' });
+      if (doc.error) throw fail('MiniMax 登录续期失败，请重新授权。', 'token_dead');
+      Object.assign(c, grant(doc, c), { identityPending: true });
+      // 轮换后先持久化，身份接口暂时失败也不能丢失新的 refresh_token。
+      await put(env, 'acct:' + c.id, c);
+    }
+    if (c.identityPending || !text(c.realUserID)) {
+      const realUserID = await identity(c);
+      if (c.realUserID && c.realUserID !== realUserID) throw fail('MiniMax 账号身份不一致，请重新授权。', 'token_dead');
+      Object.assign(c, { realUserID, identityPending: false });
+      await put(env, 'acct:' + c.id, c);
+    }
+    return c;
+  }
+  function view(c) {
+    return { id: c.id, label: c.label, lastRun: c.lastRun || 0, lastState: c.lastState || '', lastMsg: c.lastMsg || '', lastCredit: c.lastCredit || 0, totalCredit: c.totalCredit || 0, signedToday: c.lastOkDate === day(), ranToday: !!c.lastRun && day(c.lastRun) === day(), lastOkDate: c.lastOkDate || '' };
+  }
+  async function list(env) {
+    const accounts = [];
+    for (const id of await ids(env)) { const c = await get(env, 'acct:' + id); if (c) accounts.push(view(c)); }
+    return { accounts };
+  }
+  async function runOne(env, id, force) {
+    return merge(env, 'run:' + id, () => serial(env, 'acct:' + id, async () => {
+      const c = await get(env, 'acct:' + id);
+      if (!c) return null;
+      if (!force && c.lastOkDate === day()) return { ...view(c), state: 'already', msg: 'MiniMax 今日已签到。' };
+      let state = 'wait', msg = 'MiniMax 当前没有可领取的签到积分。', credit = 0, signed = false;
+      try {
+        await credential(env, c);
+        const before = panel(unwrap(await api('/minimax-cloud/api/v1/signin/status', c)));
+        signed = before.days.some(d => d.is_today && d.status === 3);
+        const target = before.days.find(d => d.status === 2);
+        if (signed) { state = 'already'; msg = 'MiniMax 今日已签到。'; }
+        else if (target) {
+          let doc;
+          try { doc = await api('/minimax-cloud/api/v1/signin/claim', c, '{}'); }
+          catch (e) {
+            if (e?.uncertain) throw fail('MiniMax 领取结果待确认，下次运行将先查询签到面板。', 'pending');
+            throw e;
+          }
+          const receipt = unwrap(doc);
+          const after = panel(receipt.panel);
+          if (!text(receipt.claim_id) || ![1, 2].includes(receipt.claim_result) || !Number.isInteger(receipt.day_no) || receipt.day_no !== target.day_no || !number(receipt.points) || !number(receipt.expire_at_ms) || !after.days.some(d => d.day_no === receipt.day_no && d.status === 3)) throw fail();
+          signed = after.days.some(d => d.is_today && d.status === 3);
+          state = receipt.claim_result === 1 ? 'checked' : 'already';
+          // points 已包含奖励，不再叠加 bonus_points。
+          credit = receipt.claim_result === 1 ? receipt.points : 0;
+          msg = receipt.claim_result === 1 ? '领取成功 +' + credit + ' 积分' : 'MiniMax 服务端确认已领取。';
+        }
+      } catch (e) { const err = safe(e); state = err.state; msg = err.message; }
+      Object.assign(c, { lastRun: Date.now(), lastState: state, lastMsg: msg, lastCredit: credit, totalCredit: (c.totalCredit || 0) + credit });
+      if (signed) c.lastOkDate = day();
+      await put(env, 'acct:' + id, c);
+      return { ...view(c), state, msg };
+    }));
+  }
+  async function run(env, force) {
+    const results = [];
+    for (const id of await ids(env)) {
+      try { const r = await runOne(env, id, force); if (r) results.push(r); }
+      catch (e) { results.push({ id, label: 'MiniMax-' + id.slice(0, 6), state: 'error', msg: safe(e).message }); }
+    }
+    return { count: results.length, results };
+  }
+  async function fetchHandler(request, env) {
+    const auth = requireAdmin(request, env);
+    if (!auth.ok) return auth.res;
+    try {
+      const url = new URL(request.url), path = url.pathname, method = request.method;
+      if (method === 'POST' && path === '/api/login/start') return json(await start(env));
+      if (method === 'GET' && path === '/api/login/poll') return json(await poll(env, url.searchParams.get('nonce')));
+      if (method === 'GET' && path === '/api/list') return json(await list(env));
+      if (method === 'POST' && path === '/api/run') return json(await run(env, url.searchParams.get('force') === '1'));
+      if (method === 'POST' && ['/api/rename', '/api/remove'].includes(path)) {
+        const body = await request.json().catch(() => ({}));
+        if (!idValid(body?.id)) return json({ error: '无效账号 ID。' }, 400);
+        return await serial(env, 'acct:' + body.id, async () => {
+          const c = await get(env, 'acct:' + body.id);
+          if (!c) return json({ error: '账号不存在。' }, 404);
+          if (path === '/api/rename') {
+            const label = text(body.label);
+            if (!label || label.length > 80) return json({ error: '备注名须为 1–80 个字符。' }, 400);
+            c.label = label; await put(env, 'acct:' + body.id, c);
+          } else {
+            await serial(env, 'index', async () => {
+              const list = await ids(env);
+              await kvWrite(env, INDEX, () => env.MINIMAX_KV.put(INDEX, JSON.stringify(list.filter(id => id !== body.id))));
+            });
+            await kvWrite(env, 'acct:' + body.id, () => env.MINIMAX_KV.delete('acct:' + body.id));
+          }
+          return json({ ok: true });
+        });
+      }
+      return json({ error: 'not found' }, 404);
+    } catch (e) { const err = safe(e); return json({ error: err.message }, err.status); }
+  }
+  return { fetch: fetchHandler };
+})();
+
+/* ================================================================== */
 /* 模块四：外壳 —— 绑定适配 / 路由分发 / 控制台 */
 /* ================================================================== */
 
@@ -3039,6 +3334,10 @@ function qoderEnv(env) {
   };
 }
 
+function minimaxEnv(env) {
+  return { ...env, MINIMAX_KV: kvFor(env, 'minimax:') };
+}
+
 /* ---------------- 通用响应与鉴权 ---------------- */
 
 function json(data, status = 200) {
@@ -3110,6 +3409,7 @@ async function runAll(env, origin, force) {
     ['trae', Trae, traeEnv(env)],
     ['wb', WorkBuddy, wbEnv(env)],
     ['qoder', Qoder, qoderEnv(env)],
+    ['minimax', MiniMax, minimaxEnv(env)],
   ]) {
     try {
       out[key] = await runPlatform(mod, e, origin, force);
@@ -3454,7 +3754,7 @@ async function sendQQ(cfg, text) {
 }
 
 /* ---- 汇总文本 ---- */
-const PLATFORM_LABEL = { trae: 'Trae', wb: 'WorkBuddy', qoder: 'Qoder' };
+const PLATFORM_LABEL = { trae: 'Trae', wb: 'WorkBuddy', qoder: 'Qoder', minimax: 'MiniMax' };
 
 function tally(d) {
   const rs = Array.isArray(d?.results) ? d.results : [];
@@ -3473,7 +3773,7 @@ function formatReport(result) {
   lines.push('📋 签到完成 · ' + (at ? at.slice(5, 16) : ''));
 
   let anyBad = false;
-  for (const key of ['trae', 'wb', 'qoder']) {
+  for (const key of ['trae', 'wb', 'qoder', 'minimax']) {
     const d = result[key];
     const name = PLATFORM_LABEL[key];
     if (!d) continue;
@@ -3525,14 +3825,14 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-11-02';
+const BUILD = '2026-11-12';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>签到控制台 · Trae + WorkBuddy + Qoder</title>
+<title>签到控制台 · Trae + WorkBuddy + Qoder + MiniMax</title>
 <style>
   :root{
     --bg:#eef1f5;--glow-a:rgba(16,160,110,.11);--glow-b:rgba(56,110,220,.09);--grid:rgba(15,23,42,.035);
@@ -3827,6 +4127,7 @@ const PAGE = `<!DOCTYPE html>
       <button class="tab on" data-tab="trae">Trae <b id="cntTrae">0</b></button>
       <button class="tab" data-tab="wb">WorkBuddy <b id="cntWb">0</b></button>
       <button class="tab" data-tab="qoder">Qoder <b id="cntQoder">0</b></button>
+      <button class="tab" data-tab="minimax">MiniMax <b id="cntMinimax">0</b></button>
     </nav>
 
     <section class="panel" id="panel-trae">
@@ -3914,13 +4215,47 @@ const PAGE = `<!DOCTYPE html>
         </div>
       </div>
     </section>
+
+    <section class="panel" id="panel-minimax" hidden>
+      <div class="grid">
+        <div class="col">
+          <div class="card actions">
+            <button class="pri" data-run="minimax">立即签到</button>
+            <button data-refresh="minimax">刷新</button>
+            <div class="err" id="err-minimax"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>MiniMax 账号</h2><span class="meta" id="lastRun-minimax">—</span></div>
+            <div class="list" id="list-minimax"><div class="empty">加载中…</div></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <div class="card-head"><h2>设备授权 · MiniMax</h2></div>
+            <div class="row">
+              <button class="pri" id="minimaxAdd">授权账号</button>
+              <a class="gh" id="minimaxLink" href="#" target="_blank" rel="noopener noreferrer" hidden>打开官方授权页</a>
+            </div>
+            <div class="pass-help" id="minimaxCodeBox" hidden>
+              <span class="lbl" style="margin-bottom:4px">当前授权码</span>
+              <div class="row">
+                <code id="minimaxCode" style="font-size:15px;font-weight:700;letter-spacing:.08em"></code>
+                <span class="hint" id="minimaxExpire" style="margin-top:0"></span>
+              </div>
+            </div>
+            <div class="hint" id="minimaxStatus">点按钮在新窗口打开官方授权页，核对授权码后确认，账号会自动保存。</div>
+            <div class="hint">仅支持 MiniMax Code 国内版官方网页授权，管理令牌不会发往官方页。</div>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 
 </div>
 <script>
 var $ = function(s){ return document.querySelector(s); };
 var PWD_KEY = 'signin-admin-pwd';
-var state = { tok:'', tab:'trae', data:{ trae:null, wb:null, qoder:null } };
+var state = { tok:'', tab:'trae', data:{ trae:null, wb:null, qoder:null, minimax:null } };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
@@ -4034,16 +4369,22 @@ function login(password){
 }
 
 function logout(msg){
-  stopWbQr(); stopQoderQr();
+  var mmPopup = mmWin;
+  stopWbQr(); stopQoderQr(); stopMinimaxLogin();
+  if(mmPopup && !mmPopup.closed){ try { mmPopup.close(); } catch(e){} }
   state.tok = '';
-  state.data = { trae:null, wb:null, qoder:null };
+  state.data = { trae:null, wb:null, qoder:null, minimax:null };
   localStorage.removeItem(PWD_KEY);
   $('#pwd').value = '';
   $('#list-trae').innerHTML = '<div class="empty">加载中…</div>';
   $('#list-wb').innerHTML = '<div class="empty">加载中…</div>';
   $('#list-qoder').innerHTML = '<div class="empty">加载中…</div>';
+  $('#list-minimax').innerHTML = '<div class="empty">加载中…</div>';
+  $('#cntMinimax').textContent = '0';
+  $('#lastRun-minimax').textContent = '—';
   $('#statAll').textContent = '—';
-  showErr('trae',''); showErr('wb',''); showErr('qoder','');
+  mmReset();
+  showErr('trae',''); showErr('wb',''); showErr('qoder',''); showErr('minimax','');
   setLoginErr(msg || '');
   $('#mainView').hidden = true;
   $('#loginView').hidden = false;
@@ -4139,6 +4480,53 @@ function renderQoder(d){
 
 
 
+/* MiniMax：lastRun 是毫秒时间戳，转成北京时间 YYYY-MM-DDTHH:mm 再复用 lastRunOf/显示 */
+function mmBjIso(ms){
+  var n = Number(ms);
+  return (isFinite(n) && n > 0) ? new Date(n + 8*3600e3).toISOString().slice(0,16) : '';
+}
+function tagMinimax(a){
+  if(a.signedToday) return '<span class="tag t-ok">已签</span>';
+  if(a.lastState==='token_dead') return '<span class="tag t-bad">令牌失效</span>';
+  if(a.lastState==='error' && a.ranToday) return '<span class="tag t-bad">签到失败</span>';
+  if(a.lastState==='pending' && a.ranToday) return '<span class="tag t-warn">待确认</span>';
+  if(a.lastState==='wait' && a.ranToday) return '<span class="tag t-idle">无可领</span>';
+  return '<span class="tag t-idle">今日未签</span>';
+}
+function msgMinimax(a){
+  if(a.signedToday) return a.lastMsg || '';
+  if(a.lastState==='token_dead') return a.lastMsg || '请重新授权';
+  if(a.ranToday && (a.lastState==='error' || a.lastState==='pending' || a.lastState==='wait')) return a.lastMsg || '';
+  return '';
+}
+
+function renderMinimax(d){
+  var box = $('#list-minimax');
+  var accounts = (d && d.accounts) || [];
+  state.data.minimax = { accounts: accounts };
+  $('#lastRun-minimax').textContent = lastRunOf(accounts.map(function(a){ return { lastRun: mmBjIso(a.lastRun) }; }));
+  $('#cntMinimax').textContent = accounts.filter(function(a){ return a.signedToday; }).length + '/' + accounts.length;
+  if(!accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「授权账号」</div>'; return; }
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>累计</th><th>上次运行</th><th></th></tr></thead><tbody>'
+    + accounts.map(function(a){
+        var m = msgMinimax(a);
+        var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + esc(a.lastCredit) : '—';
+        var rgn = '<span class="rgn" title="国内版 minimaxi.com">国内版</span>';
+        var t = mmBjIso(a.lastRun);
+        return '<tr>'
+          + '<td class="labcell" data-label="备注">' + labCellHtml('minimax', a.id, a.label, rgn) + '</td>'
+          + '<td class="st" data-label="状态">' + tagMinimax(a)
+            + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
+          + '<td class="num" data-label="本次">' + gain + '</td>'
+          + '<td class="num" data-label="累计">' + esc(fmt(a.totalCredit)) + '</td>'
+          + '<td class="time" data-label="上次运行">' + (t ? esc(t.replace('T',' ').slice(5,16)) : '—') + '</td>'
+          + '<td data-label="操作" class="ops"><button data-del="minimax|' + esc(a.id) + '">删除</button></td>'
+          + '</tr>';
+      }).join('') + '</tbody></table>'
+    + '<div class="thint">点账号名或右边的铅笔，可以改备注</div>';
+  bindDel();
+}
+
 /* 备注单元格：名字 + 常驻铅笔，点哪个都能就地改名；extra 用来插版本小标 */
 function labCellHtml(p, id, label, extra){
   var k = 'data-rename="' + p + '|' + esc(id) + '" data-name="' + esc(label) + '"';
@@ -4203,7 +4591,7 @@ function bindDel(){
 }
 
 function renderStat(){
-  var loaded = ['trae','wb','qoder'].filter(function(k){ return state.data[k]; });
+  var loaded = ['trae','wb','qoder','minimax'].filter(function(k){ return state.data[k]; });
   if(!loaded.length){ $('#statAll').textContent = '—'; return; }
   var all = [];
   loaded.forEach(function(k){ all = all.concat(state.data[k].accounts || []); });
@@ -4214,26 +4602,25 @@ function renderStat(){
 /* ---------------- 加载与签到 ---------------- */
 
 var API_URL = {
-  list:  { trae:'/trae/api/list', wb:'/wb/api/list', qoder:'/qoder/api/list' },
-  run:   { trae:'/trae/api/run?force=1', wb:'/wb/api/run?force=1', qoder:'/qoder/api/run?force=1' },
-  rename:{ trae:'/trae/api/rename', wb:'/wb/api/rename', qoder:'/qoder/api/rename' },
-  remove:{ trae:'/trae/api/accounts/remove', wb:'/wb/api/remove', qoder:'/qoder/api/remove' },
-  name:  { trae:'Trae', wb:'WorkBuddy', qoder:'Qoder' }
+  list:   { trae:'/trae/api/list', wb:'/wb/api/list', qoder:'/qoder/api/list', minimax:'/minimax/api/list' },
+  run:    { trae:'/trae/api/run?force=1', wb:'/wb/api/run?force=1', qoder:'/qoder/api/run?force=1', minimax:'/minimax/api/run?force=1' },
+  rename: { trae:'/trae/api/rename', wb:'/wb/api/rename', qoder:'/qoder/api/rename', minimax:'/minimax/api/rename' },
+  remove: { trae:'/trae/api/accounts/remove', wb:'/wb/api/remove', qoder:'/qoder/api/remove', minimax:'/minimax/api/remove' },
+  name:   { trae:'Trae', wb:'WorkBuddy', qoder:'Qoder', minimax:'MiniMax' },
+  render: { trae:renderTrae, wb:renderWb, qoder:renderQoder, minimax:renderMinimax }
 };
 
 function load(p){
   return api(API_URL.list[p])
     .then(function(d){
-      if(p === 'trae') renderTrae(d);
-      else if(p === 'wb') renderWb(d);
-      else renderQoder(d);
+      (API_URL.render[p] || renderQoder)(d);
       renderStat();
     })
     .catch(function(e){ showErr(p, e); renderStat(); });
 }
 
 function loadAll(){
-  return Promise.all([load('trae'), load('wb'), load('qoder')]);
+  return Promise.all([load('trae'), load('wb'), load('qoder'), load('minimax')]);
 }
 
 function runOne(p){
@@ -4255,11 +4642,11 @@ function runOne(p){
 function runAll(){
   var btn = $('#runAll');
   btn.disabled = true; btn.textContent = '签到中…';
-  showErr('trae',''); showErr('wb','');
+  showErr('trae',''); showErr('wb',''); showErr('qoder',''); showErr('minimax','');
   api('/api/run-all?force=1', { method:'POST', body:'{}' })
     .then(function(d){
       var lines = [];
-      ['trae','wb','qoder'].forEach(function(k){
+      ['trae','wb','qoder','minimax'].forEach(function(k){
         var r = d[k] || {};
         if(r.error){ lines.push(API_URL.name[k] + ': ' + r.error); return; }
         (r.results || []).forEach(function(x){
@@ -4282,7 +4669,7 @@ document.querySelectorAll('.tab').forEach(function(t){
     var p = t.dataset.tab;
     state.tab = p;
     document.querySelectorAll('.tab').forEach(function(x){ x.classList.toggle('on', x === t); });
-    ['trae','wb','qoder'].forEach(function(k){ $('#panel-' + k).hidden = p !== k; });
+    ['trae','wb','qoder','minimax'].forEach(function(k){ $('#panel-' + k).hidden = p !== k; });
   };
 });
 
@@ -4472,6 +4859,146 @@ function bindQoderAdd(sel, region, regionName){
 }
 
 bindQoderAdd('#qoderAddCn', 'cn', '国内版');
+
+/* ---------------- MiniMax 授权登录（国内版） ---------------- */
+
+var MM_HOSTS = ['account.minimax.cn', 'agent.minimaxi.com', 'agent.minimax.cn'];
+var MM_IDLE = '点按钮在新窗口打开官方授权页，核对授权码后确认，账号会自动保存。';
+var mmGen = 0, mmTimer = null, mmWin = null;
+
+/* 只放行官方 HTTPS 域名：不带账号密码、不带非默认端口；其余一律拒绝 */
+function safeOfficialUrl(u){
+  try{
+    var x = new URL(String(u));
+    if(x.protocol !== 'https:') return '';
+    if(MM_HOSTS.indexOf(x.hostname) < 0) return '';
+    if(x.username || x.password || x.port) return '';
+    return x.href;
+  }catch(e){ return ''; }
+}
+function mmMs(v, fallback){
+  var n = Number(v);
+  return (isFinite(n) && n > 0) ? Math.max(1000, Math.min(60000, n)) : fallback;
+}
+function mmClock(ms){
+  var n = Number(ms);
+  return isFinite(n) && n > 0 ? new Date(n + 8*3600e3).toISOString().slice(11,19) : '';
+}
+function mmCloseWin(w){ if(w && !w.closed){ try { w.close(); } catch(e){} } }
+function mmStatus(t){ $('#minimaxStatus').textContent = t ? String(t) : ''; }
+/* 授权码 / 官方入口：用 textContent 与 href 赋值，不拼 HTML；href 必须先过白名单 */
+function mmShow(code, url, expiresAt){
+  var link = $('#minimaxLink');
+  $('#minimaxCode').textContent = code || '';
+  $('#minimaxExpire').textContent = mmClock(expiresAt) ? '有效至 ' + mmClock(expiresAt) + '（北京时间）' : '';
+  $('#minimaxCodeBox').hidden = !code;
+  if(url){ link.href = url; link.hidden = false; }
+  else { link.hidden = true; link.href = '#'; }
+}
+function mmReset(){
+  $('#minimaxAdd').disabled = false;
+  $('#minimaxAdd').textContent = '授权账号';
+  mmShow('', '', 0);
+  mmStatus(MM_IDLE);
+  showErr('minimax', '');
+}
+/* 停掉当前授权：代数 +1 使在途的 start/poll 响应全部作废（退出登录后迟到的响应不会再重启轮询） */
+function stopMinimaxLogin(){
+  mmGen++;
+  if(mmTimer){ clearTimeout(mmTimer); mmTimer = null; }
+  mmWin = null;
+}
+/* 终止态：停轮询、关弹窗、收起授权码、恢复按钮并提示 */
+function mmEnd(win, msg){
+  if(mmTimer){ clearTimeout(mmTimer); mmTimer = null; }
+  mmCloseWin(win);
+  mmWin = null;
+  mmShow('', '', 0);
+  $('#minimaxAdd').disabled = false;
+  $('#minimaxAdd').textContent = '授权账号';
+  mmStatus(msg);
+}
+
+/* 递归 setTimeout：上一次 poll 返回后才排下一次，不会重叠；间隔取服务端最新毫秒值 */
+function pollMinimax(gen, nonce, interval, expiresAt, win, errs){
+  mmTimer = setTimeout(function(){
+    mmTimer = null;
+    if(gen !== mmGen) return;
+    if(Date.now() > expiresAt + 15000){
+      mmEnd(win, '授权已过期，请重新点「授权账号」');
+      return;
+    }
+    api('/minimax/api/login/poll?nonce=' + encodeURIComponent(nonce)).then(function(r){
+      if(gen !== mmGen) return;
+      r = r || {};
+      if(r.status === 'authorized'){
+        mmEnd(win, '授权成功，账号已保存。');
+        load('minimax');
+      }else if(r.status === 'expired'){
+        mmEnd(win, r.message || '授权已过期，请重新点「授权账号」');
+      }else if(r.status === 'failed'){
+        mmEnd(win, r.message || '授权失败，请重新点「授权账号」');
+      }else{
+        /* pending（含服务端 slow_down 后调大的 interval） */
+        if(r.message) mmStatus(r.message);
+        pollMinimax(gen, nonce, mmMs(r.interval, interval), expiresAt, win, 0);
+      }
+    }).catch(function(e){
+      if(gen !== mmGen) return;
+      if(errs < 2){ pollMinimax(gen, nonce, interval, expiresAt, win, errs + 1); return; }
+      mmEnd(win, String((e && e.message) || e));
+    });
+  }, interval);
+}
+
+function startMinimax(){
+  stopMinimaxLogin();
+  var gen = mmGen;
+  var btn = $('#minimaxAdd');
+  btn.disabled = true; btn.textContent = '获取中…';
+  showErr('minimax', '');
+  mmShow('', '', 0);
+  mmStatus('正在向 MiniMax 申请设备授权…');
+
+  /* 同步先开空窗口（点击手势内），接口返回后再开会被浏览器拦截；管理令牌绝不传给官方页 */
+  var win = window.open('about:blank', 'minimax-login', 'width=640,height=880');
+  mmWin = win;
+
+  api('/minimax/api/login/start', { method:'POST', body:'{}' })
+    .then(function(d){
+      if(gen !== mmGen){ if(win !== mmWin) mmCloseWin(win); return; }
+      d = d || {};
+      var url = safeOfficialUrl(d.verificationUrl);
+      var expiresAt = Number(d.expiresAt);
+      if(!url || !d.nonce || !d.userCode || !isFinite(expiresAt)){
+        throw new Error('授权信息不是官方地址或格式异常，已拒绝打开。');
+      }
+      var opened = false;
+      if(win && !win.closed){
+        try { win.opener = null; } catch(e){}
+        try { win.location.href = url; opened = true; } catch(e) { opened = false; }
+      }
+      mmShow(String(d.userCode), url, expiresAt);
+      mmStatus(opened
+        ? '已在新窗口打开官方授权页，核对授权码并确认后，本页会自动保存账号。'
+        : '新窗口被拦截了：请点下方「打开官方授权页」，核对授权码并确认。');
+      btn.textContent = '授权账号';
+      btn.disabled = false;
+      pollMinimax(gen, String(d.nonce), mmMs(d.interval, 5000), expiresAt, win, 0);
+    })
+    .catch(function(e){
+      if(gen !== mmGen){ if(win !== mmWin) mmCloseWin(win); return; }
+      mmCloseWin(win);
+      mmWin = null;
+      showErr('minimax', e);
+      mmShow('', '', 0);
+      mmStatus(MM_IDLE);
+      btn.textContent = '授权账号';
+      btn.disabled = false;
+    });
+}
+
+$('#minimaxAdd').onclick = startMinimax;
 
 /* ---------------- 事件绑定 ---------------- */
 
@@ -4791,31 +5318,17 @@ export default {
         return await Qoder.fetch(repath(request, path.slice(6) || '/'), qoderEnv(env), ctx);
       }
 
+      if (path.startsWith('/minimax/')) {
+        return await MiniMax.fetch(repath(request, path.slice(8) || '/'), minimaxEnv(env));
+      }
       return json({ error: 'not found' }, 404);
     } catch (e) {
       return json({ error: e.message || String(e) }, 500);
     }
   },
 
-  /** Cloudflare Cron Trigger：三个平台依次签到，互不影响 */
+  /** Cloudflare Cron Trigger：四平台统一签到并汇总通知。 */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        const pending = [];
-        const sink = { waitUntil: (p) => pending.push(p) };
-        for (const [mod, e] of [
-          [Trae, traeEnv(env)],
-          [WorkBuddy, wbEnv(env)],
-          [Qoder, qoderEnv(env)],
-        ]) {
-          try {
-            await mod.scheduled({}, e, sink);
-          } catch {
-            /* 一个平台整体失败不影响另一个 */
-          }
-        }
-        await Promise.allSettled(pending);
-      })()
-    );
+    ctx.waitUntil(runAll(env, 'https://scheduled.invalid', false));
   },
 };

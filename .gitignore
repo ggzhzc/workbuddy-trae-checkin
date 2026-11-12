@@ -1,0 +1,21 @@
+# 本地 Agent 工作状态与临时片段
+.claude/
+.superpowers/
+
+# 依赖与本地 Worker 缓存
+node_modules/
+.wrangler/
+
+# 测试源码、报告、覆盖率与临时产物
+tests/
+coverage/
+.nyc_output/
+.test-artifacts/
+test-results/
+playwright-report/
+playwright/.cache/
+tests/artifacts/
+tests/.cache/
+*.lcov
+*.tap
+*.log

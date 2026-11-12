@@ -1,42 +1,52 @@
-# Trae + WorkBuddy + Qoder 每日签到 · Cloudflare Worker
+# Trae + WorkBuddy + Qoder + MiniMax 每日签到 · Cloudflare Worker
 
-把三个平台的每日签到搬到云端：**不用开电脑、不用装客户端、不用守时间**。各登录一次把账号托管进去，之后 Worker 自己续期令牌、按时签到。
+把四个平台的每日签到搬到云端：**不用开电脑、不用装客户端、不用守时间**。各登录一次把账号托管进去，之后 Worker 自动续期令牌、按时签到。
 
-全部代码在 `worker.js` 一个文件里，没有构建、没有依赖，粘进 Cloudflare 网页控制台就能跑。
+全部运行代码在 `worker.js` 一个文件里，没有构建、没有新增运行依赖，粘进 Cloudflare 网页控制台即可部署。
 
-|        | Trae    | WorkBuddy | Qoder           |
-| ------ | ------- | --------- | --------------- |
-| 加账号    | 抖音扫码    | 微信扫码      | 官网设备授权（国内版）     |
-| 签到内容   | 每日积分领取  | 每日签到      | 每日活动领取（credits） |
-| 列表额外信息 | 余额、本次到账 | 连签天数、本期累计 | 本次到账、累计领取       |
+| | Trae | WorkBuddy | Qoder | MiniMax Code |
+| --- | --- | --- | --- | --- |
+| 加账号 | 抖音扫码 | 微信扫码 | 官网设备授权（国内版） | 官网设备授权（国内版） |
+| 签到内容 | 每日积分领取 | 每日签到 | 每日活动领取（credits） | 七日签到积分领取 |
+| 列表额外信息 | 余额、本次到账 | 连签天数、本期累计 | 本次到账、累计领取 | 本次到账、本工具累计领取 |
 
-三个平台共用一套部署、一个 KV，数据按 `trae:` / `wb:` / `qoder:` 前缀隔离。
+四个平台共用一套部署、一个 KV，数据按 `trae:` / `wb:` / `qoder:` / `minimax:` 前缀隔离。
+
+> **验证边界**：MiniMax 接入经过本地模拟 HTTP、KV 与页面脚本测试；真实 MiniMax 服务、Cloudflare 出口风控和线上账户行为**尚未验证**，不代表已经线上签到成功。
 
 ---
 
 ## 一、部署
 
-全程在 Cloudflare 网页控制台完成，不用装工具、不用命令行。
+### 已有部署升级
 
-1. [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Create**，起个名字（如 `signin-all`）
-2. 点 **Edit code**，把 `worker.js` 全文粘进去 → **Deploy**
+**只替换 `worker.js` 全文并重新部署**。继续使用原有 `KV`、`MASTER_KEY`、`ADMIN_TOKEN`、可选 `CRON_SECRET` 和 Cron Trigger，不需要新环境变量、KV Namespace 或 Durable Object，也不需要迁移旧平台数据。
+
+**不要重新生成或替换 `MASTER_KEY`**，否则已有密文无法解密。升级后打开控制台的 MiniMax 标签页，为每个 MiniMax 账号完成一次官方授权即可。原有三个平台无需重新登录。
+
+### 首次部署
+
+全程在 Cloudflare 网页控制台完成，不用安装工具或使用命令行。
+
+1. [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Create**，起个名字（如 `signin-all`）。
+2. 点 **Edit code**，把 `worker.js` 全文粘进去 → **Deploy**。
 3. 回 Worker 设置页，加这几个绑定：
 
-| 类型              | 名称            | 值                                            |
-| --------------- | ------------- | -------------------------------------------- |
-| KV Namespace 绑定 | `KV`          | 先到 **Storage & Databases → KV** 建一个命名空间，回来选中 |
-| Secret          | `MASTER_KEY`  | 32 字节随机值的 base64，用来加密所有令牌                    |
-| Secret          | `ADMIN_TOKEN` | 你自己定的**页面登录密码**                              |
+| 类型 | 名称 | 值 |
+| --- | --- | --- |
+| KV Namespace 绑定 | `KV` | 先到 **Storage & Databases → KV** 建一个命名空间，回来选中 |
+| Secret | `MASTER_KEY` | 32 字节随机值的 base64，用来加密令牌 |
+| Secret | `ADMIN_TOKEN` | 你自己定的**页面登录密码** |
 
-生成主密钥：浏览器 F12 → Console 里跑
+仅首次配置时生成主密钥：浏览器 F12 → Console 里运行：
 
 ```js
 btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 ```
 
-> 结果一定是 **44 个字符、以 `=` 结尾**。`MASTER_KEY` 丢了 = KV 里的令牌全解不开，只能重新扫码，**存进密码管理器**。
+> 结果是 **44 个字符、以 `=` 结尾**。`MASTER_KEY` 丢失会导致 KV 里的令牌无法解密，只能重新授权；请存进密码管理器。
 
-1. **Settings → Triggers → Cron Triggers** 加一条：`10 0 * * *`（北京 08:10）
+4. **Settings → Triggers → Cron Triggers** 加一条：`10 0 * * *`（北京 08:10）。
 
 ---
 
@@ -48,41 +58,55 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 点「添加账号」→ 抖音扫码确认 → 浏览器会跳到一个**打不开的** `127.0.0.1` 页面（正常）→ 复制地址栏整段链接，回控制台粘到右侧输入框（粘贴即生效，不用点按钮）。
 
-![从浏览器地址栏复制 127.0.0.1 那整段链接，粘到控制台右侧「扫码登录 · TRAE」下方的输入框](screenshot-console-trae.png)
+![从浏览器地址栏复制 127.0.0.1 那整段链接，粘到控制台右侧「扫码登录 · TRAE」下方的输入框](assets/images/screenshot-console-trae.png)
 
-要注意的是：**粘的是扫码之后那个 `127.0.0.1:17388/...` 的地址**，不是前面授权页的地址——图里输入框的提示文字写的也是这个。
+注意：**粘的是扫码之后那个 `127.0.0.1:17388/...` 的地址**，不是前面授权页的地址。
 
 ### WorkBuddy：微信扫码
 
 点「添加账号」→ 新窗口打开官方登录页 → 微信扫码确认 → 账号自动出现，窗口自动关闭。二维码约 5–6 分钟有效。
 
-> 官方登录页禁止被内嵌，所以是新窗口而不是弹窗内嵌。
+> 官方登录页禁止被内嵌，所以使用独立新窗口。
 
 ### Qoder：国内版设备授权
 
 点「添加账号（国内版）」→ 在新窗口登录并确认授权 → Worker 轮询到结果后自动入库。
 
+### MiniMax Code：国内版设备授权
+
+1. 切换到 **MiniMax** 标签，点「授权账号」。
+2. 在新窗口打开的官方 HTTPS 页面登录，核对控制台显示的授权码，再确认授权；如果弹窗被拦截，点「打开官方授权页」。
+3. 保持控制台打开，等待账号自动保存。授权过期或被拒绝后，重新点「授权账号」。
+
+控制台按服务端给出的间隔轮询，`slow_down` 时自动放慢；退出控制台会停止本页轮询。管理令牌不会放入官方授权链接。
+
+令牌临近过期时自动续期；轮换后的令牌先加密持久化，再查询账号身份。若身份查询暂时失败，保留已保存的令牌供重试。同一身份再次授权会更新原账号的凭据，保留备注和累计记录。
+
+**仅支持国内版**，不读取本机 MiniMax CLI 凭据，不支持国际版，不自动处理验证码。需要验证时，请在官方页面自行完成，必要时重新授权。
+
+---
+
 ## 三、控制台
 
-![签到控制台：左侧账号列表，右侧登录区](screenshot-console.png)
+![签到控制台：左侧账号列表，右侧登录区](assets/images/screenshot-console.png)
 
-顶栏「今日已签」是三个平台合计；「全部签到」三个平台一起跑；标签页分别管理，标签上的数字是当日已签数。
+顶栏「今日已签」是四个平台合计；「全部签到」四个平台一起跑；标签页分别管理，标签上的数字是当日已签数。现有截图仅展示原有平台，MiniMax 使用同样的布局。
 
-![Qoder 标签页：添加账号入口、账号表与右侧卡片](screenshot-console-qoder.png)
+![Qoder 标签页：添加账号入口、账号表与右侧卡片](assets/images/screenshot-console-qoder.png)
 
-| 标签      | 含义                       |
-| ------- | ------------------------ |
-| 已签      | 今天签上了，下方显示到账金额           |
-| 今日未签    | 还没跑，或还没到定时时间             |
-| 无可领     | 接口通了但没有可领项，下方一行写明接口返回了什么 |
-| 限流 N 分钟 | 服务端限流，已按账号冷却，到点自动重试      |
-| 待确认     | 提交成功但没收到回执，下一轮再查         |
-| 签到失败    | 请求出错，下方显示原因              |
-| 令牌失效    | 登录态失效（改过密码、在别处登出），删掉重新添加 |
+| 标签 | 含义 |
+| --- | --- |
+| 已签 | 已确认今天签到成功 |
+| 今日未签 | 还没跑，或还没到定时时间 |
+| 无可领 | 接口返回有效面板，但没有可领取项 |
+| 限流 N 分钟 | 服务端限流，账号处于冷却期 |
+| 待确认 | 领取请求结果未知，下次运行先查询服务端状态 |
+| 签到失败 | 请求出错或回执格式不符合预期 |
+| 令牌失效 | 需要重新登录或官方验证，请重新授权 |
 
-> 备注名优先取账号昵称，取不到时是 `Trae-xxxx` 这类占位名。点名字或右边的铅笔可以就地改名。
->
-> 「累计」是本工具自己记的领取量，不是官网余额（这些接口不返回余额）。
+备注名优先取账号昵称；MiniMax 使用 `MiniMax-xxxxxx` 占位名。点名字或右边的铅笔可以就地改名，删除按钮只移除本工具托管的账号记录，不代表撤销官方授权。
+
+**MiniMax 累计定义**：只统计本工具收到严格有效回执、且 `claim_result=1` 的领取量。`claim_result=2`（已经领取）不累计；回执 `points` 已含奖励，不再叠加 `bonus_points`。它**不是官网余额**，也不包含其他渠道领取、或请求结果未知而无法确认的积分。只有面板明确显示今日已领取，才标记「今日已签」；「无可领」不等于已签。
 
 ---
 
@@ -92,29 +116,27 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 Cloudflare 的 Cron **只认 UTC**：
 
-| 设置 | Cron         | 北京时间  | 作用       |
-| -- | ------------ | ----- | -------- |
-| 必设 | `10 0 * * *` | 08:10 | 三个平台各跑一遍 |
+| 设置 | Cron | 北京时间 | 作用 |
+| --- | --- | --- | --- |
+| 必设 | `10 0 * * *` | 08:10 | 四个平台各跑一遍，并发送汇总通知 |
 
 配置位置：Cloudflare 控制台 → Workers → 你的 Worker → **Settings → Triggers → Cron Triggers → Add**。
 
-> 换算：**北京 = UTC + 8**。签到接口幂等，多跑几次不会重复加分。
+> 北京 = UTC + 8。对于 MiniMax，已确认今日签到的账号默认跳过；手动强制运行也会先查面板，不会因为重复运行就重复累计。
 
 ### 方式二：外部定时器
 
-#### 1. 先设口令
+#### 1. 设置口令
 
-Cloudflare 控制台 → Workers → 你的 Worker → **Settings → Variables and Secrets**，加一个：
+Cloudflare 控制台 → Workers → 你的 Worker → **Settings → Variables and Secrets**，加一个可选 Secret：
 
-| 变量名           | 类型     | 值                                        |
-| ------------- | ------ | ---------------------------------------- |
-| `CRON_SECRET` | Secret | 随便一串长随机字符串，比如 `openssl rand -hex 24` 的输出 |
+| 变量名 | 类型 | 值 |
+| --- | --- | --- |
+| `CRON_SECRET` | Secret | 一串长随机字符串，比如 `openssl rand -hex 24` 的输出 |
 
-> 不设也行，会回退用 `ADMIN_TOKEN`。但单独设一个更安全——这样定时器口令泄露了不会连带后台也被登进去。
+> 不设会回退使用 `ADMIN_TOKEN`。建议单独设置，避免定时器口令泄露影响后台登录。
 
 #### 2. 调用
-
-有两种传口令的方式，任选一种：
 
 **方式 A：请求头（推荐）**
 
@@ -129,112 +151,97 @@ curl -X POST https://你的域名/cron \
 curl -X POST "https://你的域名/cron?key=你的CRON_SECRET"
 ```
 
-方式 B 适合那些不方便自定义请求头的调度器（比如某些面板的「URL 定时任务」）。
+方式 B 适合不能自定义请求头的调度器，但 URL 可能进入日志，应妥善保管。
 
-#### 3. 接到各个调度器上
+#### 3. 接到调度器
 
-**Linux / macOS 的 crontab**（每天 08:10 北京时间）
+**Linux / macOS 的 crontab**（调度器时区为北京时间时，每天 08:10）
 
 ```cron
 10 8 * * * curl -s -X POST https://你的域名/cron -H "X-Cron-Secret: 你的CRON_SECRET" > /dev/null 2>&1
 ```
 
-**Windows 任务计划**
+**Windows 任务计划**（系统时区为北京时间）
 
 ```powershell
 schtasks /Create /SC DAILY /ST 08:10 /TN "签到" /TR "curl.exe -s -X POST https://你的域名/cron?key=你的CRON_SECRET"
 ```
 
-
-
 #### 4. 返回什么
 
-```json
-{
-  "at": "2026-10-24 16:42:00 +08:00",
-  "trae": { "accounts": 1, "checked": 1, "already": 0, "failed": 0, "results": [...] },
-  "wb":   { "accounts": 1, "checked": 0, "already": 1, "failed": 0, "results": [...] },
-  "qoder":{ "count": 2, "results": [...] }
-}
-```
+返回结果包含 `at` 及 `trae`、`wb`、`qoder`、`minimax` 四项。各平台的 `results` 里每个账号带 `state` / `msg` 等字段；MiniMax 返回 `count` 和 `results`，每项还包含 `lastCredit`、`totalCredit` 和今日状态。
 
-各平台的 `results` 里每个账号带 `state` / `msg` / `lastCredit`。如果配了通知渠道，这里还会多一个 `notifyError`（仅当发送失败时出现）。
+如果配置了通知渠道，通知发送失败时返回 `notifyError`，不因此回滚已经完成的签到。
 
-#### 5. 几个注意点
+#### 5. 注意事项
 
-- **不会重复加分**：签到接口是幂等的，多调几次只是多跑几遍流程，已经领过的会显示「今日已签」。
-- **同一次调用会串行跑三个平台**，整体耗时取决于账号数量，通常几秒。如果调度器有超时限制（比如 5 秒），调大一点。
-- **口令错了返回 401** `{"error":"口令不对"}`；没配任何口令返回 500。
-- **`/cron` 走的是 `force=false`**：账号在冷却期内、或今天已签，会直接跳过，不会硬刷接口。想强制重试用后台的「全部签到」按钮（它是 `force=1`）。
+- 同一次调用会串行跑四个平台，整体耗时取决于账号数、网络与重试。MiniMax 每次远程请求最多等待 20 秒；KV 同键写入遇到 429 会有界指数退避。不要把调度器超时设得过短，也不要密集触发重复任务。
+- 口令错误返回 401；未配置任何口令返回 500。
+- `/cron` 和 Cloudflare scheduled 均使用 `force=false`；今天已签或处于平台冷却期的账号会跳过。控制台「全部签到」和各平台「立即签到」使用 `force=1`。
+- Cloudflare scheduled、外部 `/cron` 和「全部签到」共用四平台汇总逻辑；单平台按钮只运行该平台。
+- MiniMax 仅在**同一 isolate 内**合并同账号的在途运行、同会话的轮询，并串行处理账号修改。Workers KV 最终一致性**不是跨节点全局锁**；多节点并发仍可能导致索引、轮换令牌或累计记录冲突。请避免同时使用多个调度源触发任务。
 
 ---
 
 ## 五、签到结果通知
 
-点顶栏「通知」打开配置，两个渠道各自独立，填完点「发测试」就能立刻验证。
+点顶栏「通知」打开配置，两个渠道各自独立，填完点「发测试」验证。
 
-![通知设置：Telegram 与 QQ 机器人，密钥明文回显，下方是本机取 OpenID 的命令](screenshot-notify.png)
+![通知设置：Telegram 与 QQ 机器人，密钥明文回显，下方是本机取 OpenID 的命令](assets/images/screenshot-notify.png)
 
-每轮跑完（定时任务或「全部签到」）推一条汇总，两个渠道各管各的，都不配就静默跳过。
+每轮四平台运行结束（定时任务或「全部签到」）推送一条汇总；两个渠道独立，都不配则静默跳过。
 
 ### Telegram
 
-1. 找 [@BotFather](https://t.me/BotFather) 发 `/newbot`，拿到 `123456:ABC...` → 填 **Bot Token**
-2. 先给你的 bot 发一条消息，再打开 `https://api.telegram.org/bot<token>/getUpdates`，找 `"chat":{"id":123456789}` → 填 **Chat ID**
+1. 找 [@BotFather](https://t.me/BotFather) 发 `/newbot`，拿到 `123456:ABC...` → 填 **Bot Token**。
+2. 先给 bot 发消息，再打开 `https://api.telegram.org/bot<token>/getUpdates`，找 `"chat":{"id":123456789}` → 填 **Chat ID**。
 
 ### QQ 官方机器人
 
-到 [q.qq.com](https://q.qq.com) 建一个机器人，拿 **AppID** 和 **AppSecret** 填进页面。
+到 [q.qq.com](https://q.qq.com) 建机器人，将 **AppID** 和 **AppSecret** 填进页面。
 
-**OpenID 用一个本机脚本拿**，不需要域名、不需要备案：
+**OpenID 用本机脚本获取**，不需要域名或备案：
 
 ```bash
 curl -O https://你的域名/qq/openid-helper.mjs && node openid-helper.mjs <AppID> <AppSecret>
 ```
 
-（弹窗里有 **Windows / macOS·Linux** 切换，两条命令都按你当前系统准备好，点「复制」即可。Windows 用 `curl.exe`（PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，不认 `-O`），macOS / Linux 用 `curl`。）
+通知弹窗有 **Windows / macOS·Linux** 切换。Windows 使用 `curl.exe`，且 PowerShell 5 中两条命令需要分开执行；macOS / Linux 可使用 `curl` 和 `&&`。
 
-脚本会连上 QQ 的 WebSocket 网关，等你 60 秒——这期间用手机 QQ 给机器人发一条私聊消息，它就会把 `user_openid` 打印出来，然后自己退出。复制那串填进页面，保存。
+脚本会连接 QQ WebSocket 网关并等待 60 秒。此时给机器人发送私聊消息，它会打印 `user_openid` 并退出；复制后填进页面保存。QQ 用户需在客户端机器人设置里打开「允许主动发送消息」，主动消息仍受官方频次限制。
 
-### 通知长什么样
-
-```
-📋 签到完成 · 10-24 13:55
-Trae  ✅ 1/1
-   · 我的号 领取成功 +50 积分
-WorkBuddy  ✅ 0/1 · 已签 1
-Qoder  ⚠️ 1/2 · 失败 1
-   · 备用号 没有可领取的活动
-```
-
-通道全部失败不影响签到结果，错误只会记在接口返回的 `notifyError` 里。
+通知汇总包含 MiniMax 的领取成功、已签、无可领、待确认、令牌失效等状态。通道全部失败不影响签到，错误记录在接口返回的 `notifyError` 中。
 
 ---
 
 ## 六、常见问题
 
-| 现象                                     | 处理                                        |
-| -------------------------------------- | ----------------------------------------- |
-| 提示 `未配置 ADMIN_TOKEN` / `缺少 MASTER_KEY` | Secret 名字要**完全一致**，区分大小写                  |
-| 提示 `MASTER_KEY 必须是 32 字节`              | 重新生成，确认 44 字符且以 `=` 结尾                    |
-| 提示 `未绑定 KV`                            | KV 绑定名必须**完全等于** `KV`                     |
-| 列表是空的                                  | 还没加账号，或 cron 还没到点                         |
-| Trae 扫码后停在「无法访问此网站」                    | 正常，官网只回送 127.0.0.1，复制地址栏整段链接回来粘           |
-| 粘贴后报「没找到 authCodeInfo」                 | 复制时漏了 `?` 后面的部分，重新全选地址栏                   |
-| Trae 显示「限流 N 分钟」                       | 服务端限流，等冷却结束自动重试；再加一轮 cron 更容易补上           |
-| Qoder 显示「无可领」                          | 看下面那行诊断：`返回 0 条` 多为当天没活动，`CLAIMED` 说明今天已领 |
-| 删掉账号重新添加却直接是「已绑定」                      | 旧版本的问题，本版已修；已出现的点「解除绑定」重来                 |
-| 一直没动静                                  | 检查 cron 是否配了，注意填的是 UTC                    |
-| 令牌失效                                   | 改过密码或在别处登出，删掉账号重新添加                       |
+| 现象 | 处理 |
+| --- | --- |
+| 提示 `未配置 ADMIN_TOKEN` / `缺少 MASTER_KEY` | Secret 名字必须完全一致，区分大小写 |
+| 提示 `MASTER_KEY 必须是 32 字节` | 核对原密钥是否完整、是否正确 base64 编码；已有部署不要重新生成密钥 |
+| 提示 `未绑定 KV` | KV 绑定名必须为 `KV`，升级时继续选择原 Namespace |
+| 列表是空的 | 确认已添加账号、KV 与 MASTER_KEY 未被更换 |
+| Trae 扫码后停在「无法访问此网站」 | 正常，复制地址栏的完整 127.0.0.1 链接回来粘贴 |
+| 粘贴后报「没找到 authCodeInfo」 | 复制时可能遗漏了 `?` 后的参数，重新全选地址栏 |
+| Trae 显示「限流 N 分钟」 | 等冷却结束后重试，不要密集触发 |
+| Qoder 显示「无可领」 | 查看诊断；`返回 0 条` 多为当天无活动，`CLAIMED` 表示已领取 |
+| MiniMax 授权过期或失败 | 重新点「授权账号」，在有效期内完成官方确认 |
+| MiniMax 提示登录失效或需要官方验证 | 在官方页面完成验证，再回控制台重新授权；本工具不绕过验证码 |
+| MiniMax 显示「待确认」 | 不计入累计，下次运行先查询签到面板 |
+| MiniMax 响应格式发生变化 | 未确认成功且不累计；保留错误现象，等待协议适配，不要反复强刷 |
+| 一直没有定时运行 | 检查 Cron Trigger，注意 Cloudflare 使用 UTC |
 
-排障时可以看 Worker 详情页的 **Logs**；Qoder 的细节用 `GET /qoder/api/inspect?id=<账号id>` 看，它会返回接口实际给了几条、分别是什么类型。
+排障可查看 Worker 的 **Logs**，但不要记录或公开令牌、密钥、设备码等敏感信息。Qoder 可使用 `GET /qoder/api/inspect?id=<账号id>` 查看诊断。
 
 ---
 
-## 七、说明
+## 七、安全与使用说明
 
-**安全**：KV 里存的是 AES-256-GCM 密文（每条记录独立 salt + IV，密钥由 `MASTER_KEY` 经 HKDF 派生）；接口不返回任何令牌；登录密码和账号令牌分离，泄露密码不等于丢号。边界是：令牌在 Worker 内存里必然有一刻是明文，云端能看到什么取决于你是否信任它——介意就部署到自己账号下。
+**安全**：KV 令牌采用 AES-256-GCM 加密，每条记录独立 salt 和 IV，密钥由 `MASTER_KEY` 经 HKDF 派生。MiniMax 临时授权数据同样加密，列表接口不返回令牌。`ADMIN_TOKEN` 是管理权限凭据，通知配置含敏感信息，不要泄露；公共电脑使用后退出登录。令牌在 Worker 执行时会进入明文内存，请只部署到可信账号。
 
-**限制**：三个平台的接口都是逆向得到的，客户端升级可能需要跟进适配；只做签到，没做成长期任务/兑换那套；扫码依赖官方登录页。
+**限制与风险**：本项目为非官方工具，接口或官方登录页升级可能需要适配。MiniMax 的业务签名使用 Workers Web Crypto 提供的 MD5 兼容能力，仅用于协议互操作，不用于凭据加密。真实 MiniMax 服务、Cloudflare 出口风控、线上账户行为及真实浏览器布局尚未验证；本地模拟通过不能代替线上验证。仅为自己的授权账号使用，遵守各平台规则，不用于批量刷取积分。
 
-**风险**：本项目为非官方工具， Trae、WorkBuddy、Qoder 使用风险自负。建议只给自己的账号用，多账号大规模刷积分更容易触发风控。
+**协议参考**：MiniMax 适配依据 [dsh-credit-checkin-hub 固定版本的 MiniMax 源码](https://github.com/SnailMann/dsh-credit-checkin-hub/blob/eaa387563abe9f195abea2604c0b0779df08dec3/src/minimax.js)，版本 `eaa387563abe9f195abea2604c0b0779df08dec3`。实现保留单文件 Workers 结构，不引入该项目的 Node 运行依赖。
+
+部署仅需 `worker.js`，无需安装依赖或执行构建。`README.md` 和 `assets/images/` 仅用于仓库说明，无需上传到 Cloudflare。
